@@ -1,0 +1,656 @@
+__Name__ = "SetMachinePlateInfo"
+__Version__ = "1.1.0"
+__Author__ = "Arwin Verhoeven"
+__Comment__ = "Fill in the machine plate texts, update the CAM job and export the gcode"
+
+import functools
+import logging
+import logging.handlers
+import os
+import platform
+import re
+import sys
+import tempfile
+import traceback
+
+import FreeCAD as App
+import FreeCADGui as Gui
+from PySide import QtWidgets, QtCore, QtGui
+
+# Who to send error reports to
+SUPPORT_CONTACT = "Arwin"
+LOG_FILE_NAME = "SetMachinePlateInfo.log"
+
+# Holder dimensions (mm)
+HOLDER_LENGTH = 145         # Holder size along X
+HOLDER_WIDTH = 65.5         # Holder size along Y
+HOLDER_Y_EXTRA = 2.5        # Extra Y distance between the holder corner and the plate centre line
+HOLDER_Z_OFFSET = 10        # Holder Z placement = homing Z offset - this value
+
+# Plate dimensions (mm)
+PLATE_COUNT = 7
+PLATE_WIDTH = 15.5          # Plate size along X
+PLATE_LENGTH = 61.5         # Plate size along Y
+PLATE_PITCH = 20            # Centre to centre distance between plates along X
+PLATE_Z_OFFSET = 2          # Plate/text Z placement = homing Z offset - this value
+CENTER_PLATE_INDEX = 3      # Plate 4 is the centre of the holder
+
+# Text fields (mm)
+FIELD_COUNT = 3
+FIELD_NAMES = ["Machine Naam:", "Lijn Naam:", "Serienummer:"]
+SERIAL_FIELD_INDEX = 2
+FIELD2_Y_CORRECTION = 1     # Extra Y correction for the line name field (Veld2)
+STREEP_INSET = 0.25         # Inset of the line (Streep) from the plate corner
+
+# Defaults for reference:
+#   Homing offset X/Y/Z: 0.4 / 42.999 / 10
+#   Text offset top/bottom/left/right: 15.5/4 / 15.5/4 / 1 / 1
+
+doc = App.ActiveDocument
+
+
+# ---------------------------------------------------------------------------
+# Logging and error reporting
+# ---------------------------------------------------------------------------
+
+def setupLogger():
+    logger = logging.getLogger(__Name__)
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+    # FreeCAD keeps Python running between macro runs, so remove the handlers of a previous run
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        handler.close()
+    # Fall back to the temp folder if the FreeCAD user folder is not writable
+    for folder in (App.getUserAppDataDir(), tempfile.gettempdir()):
+        path = os.path.join(folder, LOG_FILE_NAME)
+        try:
+            handler = logging.handlers.RotatingFileHandler(path, maxBytes=1000000, backupCount=2, encoding="utf-8")
+        except OSError:
+            continue
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(message)s"))
+        logger.addHandler(handler)
+        return logger, path
+    return logger, None
+
+
+log, LOG_FILE = setupLogger()
+
+
+def environmentInfo():
+    return "\n".join([
+        f"Macro: {__Name__} {__Version__}",
+        f"FreeCAD: {' '.join(App.Version()[:4])}",
+        f"Python: {sys.version.split()[0]}",
+        f"Qt: {QtCore.qVersion()}",
+        f"OS: {platform.platform()}",
+        f"Document: {doc.FileName if doc else None}",
+        f"Log file: {LOG_FILE}",
+    ])
+
+
+def readLogTail(line_count=200):
+    if not LOG_FILE:
+        return "(no log file)"
+    try:
+        with open(LOG_FILE, encoding="utf-8", errors="replace") as f:
+            return "".join(f.readlines()[-line_count:])
+    except OSError as e:
+        return f"(could not read log file: {e})"
+
+
+def openLogFolder():
+    if LOG_FILE:
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(os.path.dirname(LOG_FILE)))
+
+
+def copyToClipboard(text):
+    QtWidgets.QApplication.clipboard().setText(text)
+
+
+def dialogParent():
+    return QtWidgets.QApplication.activeWindow() or Gui.getMainWindow()
+
+
+def showError(message):
+    # Call from inside an except block to include the traceback in the report
+    details = traceback.format_exc()
+    if details.strip() == "NoneType: None":
+        details = ""
+    log.error(message + ("\n" + details if details else ""))
+    App.Console.PrintError(f"{__Name__}: {message}\n{details}\n")
+    try:
+        report = f"{message}\n\n{environmentInfo()}\n\n{details}"
+        box = QtWidgets.QMessageBox(dialogParent())
+        box.setIcon(QtWidgets.QMessageBox.Critical)
+        box.setWindowTitle(f"{__Name__} - Error")
+        box.setText(message)
+        box.setInformativeText(f"Please click \"Copy Error Report\" and send it to {SUPPORT_CONTACT}.\n"
+                               f"Click \"Show Details...\" to see the technical details.")
+        box.setDetailedText(report)
+        copy_button = box.addButton("Copy Error Report", QtWidgets.QMessageBox.ActionRole)
+        folder_button = box.addButton("Open Log Folder", QtWidgets.QMessageBox.ActionRole)
+        box.addButton(QtWidgets.QMessageBox.Close)
+        box.exec()
+        if box.clickedButton() == copy_button:
+            # Include the recent log so we can see what happened before the error
+            copyToClipboard(report + "\n\n--- Recent log ---\n" + readLogTail())
+        elif box.clickedButton() == folder_button:
+            openLogFolder()
+    except Exception:
+        # Never let the error dialog itself hide the original error
+        log.exception("Could not show the error dialog")
+        App.Console.PrintError(traceback.format_exc())
+
+
+def showWarning(message):
+    # For user mistakes, like invalid input: no error report needed
+    log.warning(message)
+    QtWidgets.QMessageBox.warning(dialogParent(), f"{__Name__} - Warning", message)
+
+
+def guarded(action):
+    # Catch unexpected errors and show them with an error report. Exceptions in Qt
+    # button handlers would otherwise only end up in the Report view.
+    # The wrapped function returns None when an error occurred.
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            try:
+                return func(*args, **kwargs)
+            except Exception:
+                showError(f"Something went wrong while {action}.")
+                return None
+        return wrapper
+    return decorator
+
+
+# ---------------------------------------------------------------------------
+# Geometry helpers
+# ---------------------------------------------------------------------------
+
+def getObjectByLabel(label):
+    objects = doc.getObjectsByLabel(label)
+    return objects[0] if objects else None
+
+
+def requiredLabels():
+    labels = ["Holder"]
+    for p in range(PLATE_COUNT):
+        labels.append(f"Plaatje{p+1}")
+        labels.append(f"Plaatje{p+1}-Streep")
+        for v in range(FIELD_COUNT):
+            labels.append(f"Plaatje{p+1}-Veld{v+1}")
+    return labels
+
+
+def holderOrigin(home_x, home_y, home_z):
+    return App.Vector(-HOLDER_LENGTH/2 - home_x,
+                      -HOLDER_WIDTH/2 - HOLDER_Y_EXTRA - home_y,
+                      home_z - HOLDER_Z_OFFSET)
+
+
+def plateCentre(p, home_x, home_y, home_z):
+    holder = holderOrigin(home_x, home_y, home_z)
+    return App.Vector(holder.x + (p - CENTER_PLATE_INDEX) * PLATE_PITCH,
+                      holder.y,
+                      home_z - PLATE_Z_OFFSET)
+
+
+def fieldPositions(centre, top, bottom, left, right):
+    # Veld1 (machine name) and Veld2 (line name) sit at the top, Veld3 (serial) at the bottom
+    top_x = centre.x - PLATE_WIDTH/2 + top
+    bottom_x = centre.x + PLATE_WIDTH/2 - bottom
+    left_y = centre.y - PLATE_LENGTH/2 + left
+    right_y = centre.y + PLATE_LENGTH/2 - FIELD2_Y_CORRECTION - right
+    return [App.Vector(top_x, left_y, centre.z),
+            App.Vector(top_x, right_y, centre.z),
+            App.Vector(bottom_x, left_y, centre.z)]
+
+
+def setBase(obj, prop, base):
+    # Placement properties return a copy, so modify the copy and assign it back
+    placement = getattr(obj, prop)
+    placement.Base = base
+    setattr(obj, prop, placement)
+
+
+def formatNumber(value):
+    return str(round(value, 4))
+
+
+def enabledPlatesFromJob(job):
+    # A plate is enabled when its line (Streep) is in the job, see updateJob
+    model_names = {obj.Name for obj in job.Model.Group}
+    enabled = [getObjectByLabel(f"Plaatje{p+1}-Streep").Name in model_names for p in range(PLATE_COUNT)]
+    if not any(enabled):
+        # Nothing was generated with this document yet, so start with all plates enabled
+        log.info("No plates found in the job, enabling all plates")
+        return [True] * PLATE_COUNT
+    return enabled
+
+
+# ---------------------------------------------------------------------------
+# Dialog
+# ---------------------------------------------------------------------------
+
+class LabelDialog(QtWidgets.QDialog):
+    def __init__(self, job):
+        super(LabelDialog, self).__init__()
+        self.job = job
+
+        # Derive the holder offsets from the current holder placement
+        holder = getObjectByLabel("Holder").Placement.Base
+        self.home_offset_x = -HOLDER_LENGTH/2 - holder.x
+        self.home_offset_y = -HOLDER_WIDTH/2 - HOLDER_Y_EXTRA - holder.y
+        self.home_offset_z = holder.z + HOLDER_Z_OFFSET
+
+        # Derive the text offsets from the text on the centre plate
+        centre = plateCentre(CENTER_PLATE_INDEX, self.home_offset_x, self.home_offset_y, self.home_offset_z)
+        field = [getObjectByLabel(f"Plaatje{CENTER_PLATE_INDEX+1}-Veld{v+1}").AttachmentOffset.Base
+                 for v in range(FIELD_COUNT)]
+        self.text_offset_top = field[0].x - (centre.x - PLATE_WIDTH/2)
+        self.text_offset_bottom = centre.x + PLATE_WIDTH/2 - field[2].x
+        self.text_offset_left = field[0].y - (centre.y - PLATE_LENGTH/2)
+        self.text_offset_right = centre.y + PLATE_LENGTH/2 - FIELD2_Y_CORRECTION - field[1].y
+        log.info(f"Current homing offset X/Y/Z: {self.home_offset_x:.4f} / {self.home_offset_y:.4f} / {self.home_offset_z:.4f}")
+        log.info(f"Current text offset top/bottom/left/right: {self.text_offset_top:.4f} / {self.text_offset_bottom:.4f}"
+                 f" / {self.text_offset_left:.4f} / {self.text_offset_right:.4f}")
+
+        # Fit the view to the object
+        Gui.SendMsgToActiveView("ViewFit")
+
+        # Set the camera orientation to isometric
+        Gui.ActiveDocument.ActiveView.viewIsometric()
+
+        # Zoom in after a second
+        self.zoomTimer = QtCore.QTimer(self)
+        self.zoomTimer.setSingleShot(True)
+        self.zoomTimer.timeout.connect(lambda: self.zoomView())
+        self.zoomTimer.start(1000)
+
+        # Create GUI window
+        self.setWindowTitle(f"Generate Machine Label (v{__Version__})")
+
+        # Create tabs
+        self.tabs = QtWidgets.QTabWidget()
+
+        # Engraving tab
+        engraving_tab = QtWidgets.QWidget()
+        engraving_layout = QtWidgets.QVBoxLayout()
+
+        # Scroll area
+        engraving_scroll_area = QtWidgets.QScrollArea()
+        engraving_scroll_area.setWidgetResizable(True)
+
+        # Engraving container
+        engraving_container = QtWidgets.QWidget()
+        engraving_container_layout = QtWidgets.QVBoxLayout(engraving_container)
+
+        # Get current text from fields
+        self.veld_string = [[None] * FIELD_COUNT for _ in range(PLATE_COUNT)]
+        self.veld = [[None] * FIELD_COUNT for _ in range(PLATE_COUNT)]
+        # Restore which plates were enabled the last time
+        self.plate_enabled = enabledPlatesFromJob(job)
+        log.info(f"Enabled plates: {self.enabledPlateNumbers()}")
+        for p in range(PLATE_COUNT):
+            plate_title = f"Plate {p+1} " + "▯" * p + "▮" + "▯" * (PLATE_COUNT - p - 1)
+            plate_group = QtWidgets.QGroupBox(plate_title)
+            plate_layout = QtWidgets.QFormLayout()
+
+            enable_checkbox = QtWidgets.QCheckBox("Enabled")
+            enable_checkbox.setChecked(self.plate_enabled[p])
+            enable_checkbox.toggled.connect(lambda checked, plate_index=p: self.togglePlateFields(checked, plate_index))
+            plate_layout.addRow(enable_checkbox)
+
+            for v in range(FIELD_COUNT):
+                self.veld_string[p][v] = getObjectByLabel(f"Plaatje{p+1}-Veld{v+1}")
+                self.veld[p][v] = QtWidgets.QLineEdit()
+                # Empty fields are stored as hidden text objects (see updateJob)
+                if self.veld_string[p][v].Visibility:
+                    self.veld[p][v].setText(self.veld_string[p][v].String)
+                plate_layout.addRow(FIELD_NAMES[v], self.veld[p][v])
+            self.togglePlateFields(self.plate_enabled[p], p)
+
+            # Add the layout for the group box
+            plate_group.setLayout(plate_layout)
+            # Add the group to the main layout
+            engraving_container_layout.addWidget(plate_group)
+        engraving_scroll_area.setWidget(engraving_container)
+        engraving_layout.addWidget(engraving_scroll_area)
+        engraving_tab.setLayout(engraving_layout)
+
+        # Config tab
+        config_tab = QtWidgets.QWidget()
+        config_layout = QtWidgets.QVBoxLayout()
+
+        # Config tab - Holder Offset Section
+        holder_group = QtWidgets.QGroupBox("Holder Offset")
+        holder_layout = QtWidgets.QFormLayout()
+        holder_label = QtWidgets.QLabel("Offset is the distance from the fixed probe point on the machine\n"
+                                        "to the corner of the holder that is closest to the homing place")
+        holder_layout.addRow(holder_label)
+        self.field_xoffset = QtWidgets.QLineEdit(formatNumber(self.home_offset_x))
+        self.field_yoffset = QtWidgets.QLineEdit(formatNumber(self.home_offset_y))
+        self.field_zoffset = QtWidgets.QLineEdit(formatNumber(self.home_offset_z))
+        holder_layout.addRow("Homing X offset:", self.field_xoffset)
+        holder_layout.addRow("Homing Y offset:", self.field_yoffset)
+        holder_layout.addRow("Homing Z offset:", self.field_zoffset)
+        holder_group.setLayout(holder_layout)
+
+        # Config tab - Text Offsets Section
+        text_group = QtWidgets.QGroupBox("Text Offsets")
+        text_layout = QtWidgets.QFormLayout()
+        self.field_text_offset_top = QtWidgets.QLineEdit(formatNumber(self.text_offset_top))
+        self.field_text_offset_bottom = QtWidgets.QLineEdit(formatNumber(self.text_offset_bottom))
+        self.field_text_offset_left = QtWidgets.QLineEdit(formatNumber(self.text_offset_left))
+        self.field_text_offset_right = QtWidgets.QLineEdit(formatNumber(self.text_offset_right))
+        text_layout.addRow("Text Offset From Top", self.field_text_offset_top)
+        text_layout.addRow("Text Offset From Bottom", self.field_text_offset_bottom)
+        text_layout.addRow("Text Offset From Left", self.field_text_offset_left)
+        text_layout.addRow("Text Offset From Right", self.field_text_offset_right)
+        text_group.setLayout(text_layout)
+
+        config_layout.addWidget(holder_group)
+        config_layout.addWidget(text_group)
+
+        # Remember the applied values to detect offsets that were changed but not applied
+        self.offset_fields = [
+            self.field_xoffset, self.field_yoffset, self.field_zoffset,
+            self.field_text_offset_top, self.field_text_offset_bottom,
+            self.field_text_offset_left, self.field_text_offset_right]
+        self.applied_offset_texts = [field.text() for field in self.offset_fields]
+
+        # Add update button
+        self.update_offset_button = QtWidgets.QPushButton("Update Offsets")
+        config_layout.addWidget(self.update_offset_button)
+        # Use lambdas so the "checked" argument of clicked is not passed on
+        self.update_offset_button.clicked.connect(lambda: self.updateOffsets())
+
+        # Config tab - Diagnostics Section
+        diagnostics_group = QtWidgets.QGroupBox("Diagnostics")
+        diagnostics_layout = QtWidgets.QFormLayout()
+        diagnostics_layout.addRow("Version:", QtWidgets.QLabel(__Version__))
+        log_label = QtWidgets.QLabel(LOG_FILE or "(no log file)")
+        log_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        log_label.setWordWrap(True)
+        diagnostics_layout.addRow("Log file:", log_label)
+        diagnostics_buttons = QtWidgets.QHBoxLayout()
+        copy_diagnostics_button = QtWidgets.QPushButton("Copy Diagnostics")
+        copy_diagnostics_button.setToolTip(f"Copies version information and the recent log, to send to {SUPPORT_CONTACT}")
+        copy_diagnostics_button.clicked.connect(lambda: self.copyDiagnostics())
+        open_log_button = QtWidgets.QPushButton("Open Log Folder")
+        open_log_button.clicked.connect(lambda: openLogFolder())
+        diagnostics_buttons.addWidget(copy_diagnostics_button)
+        diagnostics_buttons.addWidget(open_log_button)
+        diagnostics_layout.addRow(diagnostics_buttons)
+        diagnostics_group.setLayout(diagnostics_layout)
+        config_layout.addWidget(diagnostics_group)
+        config_layout.addStretch()
+
+        config_tab.setLayout(config_layout)
+
+        # Add tabs to the tab widget
+        self.tabs.addTab(engraving_tab, "Engraving")
+        self.tabs.addTab(config_tab, "Config")
+
+        # Create main layout
+        main_layout = QtWidgets.QVBoxLayout()
+        main_layout.addWidget(self.tabs)
+
+        # Create buttons
+        self.update_button = QtWidgets.QPushButton("Update")
+        self.ok_button = QtWidgets.QPushButton("Generate")
+        self.cancel_button = QtWidgets.QPushButton("Cancel")
+        button_layout = QtWidgets.QHBoxLayout()
+        button_layout.addWidget(self.update_button)
+        button_layout.addWidget(self.ok_button)
+        button_layout.addWidget(self.cancel_button)
+        main_layout.addLayout(button_layout)
+
+        self.setLayout(main_layout)
+        self.update_button.clicked.connect(lambda: self.onUpdate())
+        self.ok_button.clicked.connect(lambda: self.onGenerate())
+        self.cancel_button.clicked.connect(self.reject)
+
+    def enabledPlateNumbers(self):
+        return [p + 1 for p in range(PLATE_COUNT) if self.plate_enabled[p]]
+
+    @guarded("updating the offsets")
+    def updateOffsets(self, show_message=True):
+        try:
+            # Get values from input boxes
+            self.home_offset_x = float(self.field_xoffset.text())
+            self.home_offset_y = float(self.field_yoffset.text())
+            self.home_offset_z = float(self.field_zoffset.text())
+            self.text_offset_top = float(self.field_text_offset_top.text())
+            self.text_offset_bottom = float(self.field_text_offset_bottom.text())
+            self.text_offset_left = float(self.field_text_offset_left.text())
+            self.text_offset_right = float(self.field_text_offset_right.text())
+        except ValueError:
+            showWarning("Invalid input! Please enter numeric values (use a dot as decimal separator).\n\n"
+                        "Entered: " + ", ".join(repr(field.text()) for field in self.offset_fields))
+            return False
+
+        log.info(f"Updating offsets. Homing X/Y/Z: {self.home_offset_x} / {self.home_offset_y} / {self.home_offset_z}, "
+                 f"text top/bottom/left/right: {self.text_offset_top} / {self.text_offset_bottom}"
+                 f" / {self.text_offset_left} / {self.text_offset_right}")
+        home = (self.home_offset_x, self.home_offset_y, self.home_offset_z)
+
+        # Update location of holder
+        setBase(getObjectByLabel("Holder"), "Placement", holderOrigin(*home))
+
+        # Update location of plates, text and line
+        for p in range(PLATE_COUNT):
+            centre = plateCentre(p, *home)
+            setBase(getObjectByLabel(f"Plaatje{p+1}"), "Placement", centre)
+            positions = fieldPositions(centre, self.text_offset_top, self.text_offset_bottom,
+                                       self.text_offset_left, self.text_offset_right)
+            for v in range(FIELD_COUNT):
+                setBase(self.veld_string[p][v], "AttachmentOffset", positions[v])
+            streep_position = App.Vector(centre.x - STREEP_INSET,
+                                         centre.y - PLATE_LENGTH/2 + STREEP_INSET,
+                                         centre.z)
+            setBase(getObjectByLabel(f"Plaatje{p+1}-Streep"), "AttachmentOffset", streep_position)
+
+        doc.recompute()
+        self.applied_offset_texts = [field.text() for field in self.offset_fields]
+        log.info("Offsets updated")
+
+        if show_message:
+            QtWidgets.QMessageBox.information(self, "Success", "Offsets updated successfully!")
+        return True
+
+    def offsetsPending(self):
+        return [field.text() for field in self.offset_fields] != self.applied_offset_texts
+
+    def confirmPendingOffsets(self):
+        # Returns True when it is OK to continue
+        if not self.offsetsPending():
+            return True
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Warning)
+        box.setWindowTitle("Offsets not updated")
+        box.setText("The offsets in the Config tab were changed, but \"Update Offsets\" was not pressed.")
+        update_button = box.addButton("Update Offsets and Continue", QtWidgets.QMessageBox.AcceptRole)
+        continue_button = box.addButton("Continue Without Updating", QtWidgets.QMessageBox.DestructiveRole)
+        box.addButton(QtWidgets.QMessageBox.Cancel)
+        box.setDefaultButton(update_button)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked == update_button:
+            log.info("Pending offsets: update and continue")
+            return bool(self.updateOffsets(show_message=False))
+        log.info("Pending offsets: " + ("continue without updating" if clicked == continue_button else "cancel"))
+        return clicked == continue_button
+
+    @guarded("updating the CAM job")
+    def onUpdate(self):
+        log.info("Update pressed")
+        if self.confirmPendingOffsets():
+            self.updateJob()
+
+    @guarded("preparing to generate the gcode")
+    def onGenerate(self):
+        log.info("Generate pressed")
+        if not self.confirmPendingOffsets():
+            return
+        if not any(self.plate_enabled):
+            showWarning("No plates are enabled, there is nothing to engrave.")
+            return
+        self.accept()
+
+    def updateJob(self):
+        log.info(f"Updating job for plates {self.enabledPlateNumbers()}")
+        managed_labels = set()
+        wanted = []
+        for p in range(PLATE_COUNT):
+            for v in range(FIELD_COUNT):
+                obj = self.veld_string[p][v]
+                text = self.veld[p][v].text()
+                managed_labels.add(obj.Label)
+                if text.strip():
+                    if obj.String != text:
+                        obj.String = text
+                    obj.Visibility = True
+                    if self.plate_enabled[p]:
+                        wanted.append(obj)
+                else:
+                    # An empty ShapeString has no geometry, so keep the old text,
+                    # hide it and leave it out of the job
+                    obj.Visibility = False
+            if self.plate_enabled[p]:
+                # repr() makes hidden characters like trailing spaces visible in the log
+                log.info(f"  Plate {p+1}: " + ", ".join(repr(field.text()) for field in self.veld[p]))
+            streep = getObjectByLabel(f"Plaatje{p+1}-Streep")
+            managed_labels.add(streep.Label)
+            if self.plate_enabled[p]:
+                wanted.append(streep)
+
+        # Replace all managed objects in the job model with the enabled ones
+        self.job.Model.Group = [item for item in self.job.Model.Group if item.Label not in managed_labels] + wanted
+
+        for obj in self.job.OutList:
+            obj.touch()
+        doc.recompute()
+        log.info(f"Job updated, model contains: {[item.Label for item in self.job.Model.Group]}")
+        return True
+
+    def defaultFileName(self):
+        serials = [self.veld[p][SERIAL_FIELD_INDEX].text().strip()
+                   for p in range(PLATE_COUNT) if self.plate_enabled[p]]
+        name = "_".join(serial for serial in serials if serial) or "output"
+        # Replace characters that are not allowed in file names
+        name = re.sub(r'[\\/:*?"<>|]+', "-", name)
+        return name + ".gcode"
+
+    def togglePlateFields(self, checked, plate_index):
+        self.plate_enabled[plate_index] = checked
+        for field in self.veld[plate_index]:
+            field.setEnabled(checked)
+
+    @guarded("copying the diagnostics")
+    def copyDiagnostics(self):
+        log.info("Copy Diagnostics pressed")
+        copyToClipboard(environmentInfo() + "\n\n--- Recent log ---\n" + readLogTail())
+        QtWidgets.QMessageBox.information(self, "Diagnostics copied",
+                                          f"The diagnostics were copied to the clipboard.\n"
+                                          f"Paste them in a message to {SUPPORT_CONTACT}.")
+
+    @guarded("zooming the view")
+    def zoomView(self):
+        Gui.ActiveDocument.ActiveView.zoomIn()
+        Gui.ActiveDocument.ActiveView.zoomIn()
+        Gui.ActiveDocument.ActiveView.zoomIn()
+
+
+# ---------------------------------------------------------------------------
+# Export
+# ---------------------------------------------------------------------------
+
+@guarded("exporting the gcode")
+def exportGcode(job, default_name):
+    # We need to make sure the CAM workbench is initialized
+    Gui.activateWorkbench("CAMWorkbench")
+    from Path.Post.Processor import PostProcessorFactory
+
+    file_path, _ = QtWidgets.QFileDialog.getSaveFileName(None, "Save Gcode", default_name, "Gcode (*.nc *.gcode)")
+    if not file_path:
+        log.info("Export cancelled in the save dialog")
+        return
+
+    log.info(f"Running post processor 'grbl' for {file_path}")
+    postprocessor = PostProcessorFactory.get_post_processor(job, "grbl")
+    if postprocessor is None:
+        showError("The 'grbl' post processor could not be loaded.")
+        return
+    post_data = list(postprocessor.export() or [])
+    log.info(f"Post processor produced {len(post_data)} output(s)")
+    if not post_data:
+        showError("The post processor did not produce any gcode.")
+        return
+    if len(post_data) > 1:
+        answer = QtWidgets.QMessageBox.warning(
+            None, "Multiple gcode outputs",
+            f"The post processor produced {len(post_data)} gcode outputs instead of 1.\n"
+            "This usually means the output settings of the Job were changed "
+            "(for example splitting the output per operation, tool or fixture).\n\n"
+            "Only the first output will be written, so the gcode is probably incomplete.\n\n"
+            "Write the first output anyway?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No)
+        if answer != QtWidgets.QMessageBox.Yes:
+            log.info("Export cancelled because of multiple outputs")
+            return
+
+    _, gcode = post_data[0]
+    custom_gcode = (
+        "(Custom GCode Start)\n"
+        "G21 ; Set units to mm\n"
+        "G90 ; Absolute positioning\n"
+        "G53 G0 Z-5 ; Move Z axis to top-5mm\n"
+        "G53 G0 X148 Y109 ; Move to fixed probe location\n"
+        "G91 ; Use relative coordinates\n"
+        "G38.2 Z-40 F50 ; Probe Z\n"
+        "G10 L20 P1 X0 Y0 Z0 ; Set workcoordinates to 0 at probe location\n"
+        "G0 Z5 ; Move slightly up\n"
+        "G90 ; Use Absolute positioning again\n"
+    )
+    with open(file_path, "w") as f:
+        f.write(custom_gcode)  # Write custom GCode at the top
+        f.write(gcode)
+    log.info(f"Gcode written to {file_path} ({len(gcode.splitlines())} lines)")
+    App.Console.PrintMessage(f"Gcode written to {file_path}\n")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+@guarded("starting the macro")
+def main():
+    log.info("=" * 70)
+    log.info("Macro started\n" + environmentInfo())
+    if doc is None:
+        showWarning("No active document. Open the machine plate document first.")
+        return
+    job = doc.getObject("Job")
+    if job is None:
+        showWarning("No CAM Job named \"Job\" was found in this document.")
+        return
+    missing = [label for label in requiredLabels() if getObjectByLabel(label) is None]
+    if missing:
+        showWarning("These objects were not found in the document:\n" + "\n".join(missing))
+        return
+
+    dialog = LabelDialog(job)
+    if dialog.exec():
+        # Refresh CAM Job, and only export when that succeeded
+        if guarded("updating the CAM job")(dialog.updateJob)():
+            exportGcode(job, dialog.defaultFileName())
+    else:
+        log.info("Dialog cancelled")
+    log.info("Macro finished")
+
+
+main()

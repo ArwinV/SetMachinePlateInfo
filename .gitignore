@@ -1,0 +1,6 @@
+# This repository lives in the FreeCAD Macro folder, which can contain other macros.
+# Ignore everything except the files that belong to this project.
+*
+!.gitignore
+!README.md
+!SetMachinePlateInfo.FCMacro
