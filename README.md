@@ -10,7 +10,7 @@ Find your FreeCAD macro folder: in FreeCAD, open **Macro → Macros...**. The fo
 
 ### Option 1: Download the file (simplest)
 
-1. Open `SetMachinePlateInfo.FCMacro` on the GitHub page of this repository.
+1. Open `SetMachinePlateInfo.FCMacro` on https://github.com/ArwinV/SetMachinePlateInfo.
 2. Click the **Download raw file** button.
 3. Put the file in the macro folder, replacing the old version.
 
@@ -22,7 +22,7 @@ Run these commands once, inside the macro folder (this also works when the folde
 
 ```
 git init
-git remote add origin <repository URL>
+git remote add origin https://github.com/ArwinV/SetMachinePlateInfo.git
 git pull origin main
 ```
 
